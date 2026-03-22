@@ -4,19 +4,31 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 
+import { readEnvFile } from './env.js';
+
 const execFileAsync = promisify(execFile);
 
+// Read transcription config from .env (NanoClaw doesn't use dotenv)
+const envConfig = readEnvFile([
+  'TRANSCRIPTION_BACKEND',
+  'WHISPER_BIN',
+  'WHISPER_MODEL',
+  'OPENAI_API_KEY',
+]);
+
 // Transcription backend: 'local' uses whisper.cpp, 'api' uses OpenAI Whisper API
-const TRANSCRIPTION_BACKEND = process.env.TRANSCRIPTION_BACKEND || 'local';
+const TRANSCRIPTION_BACKEND =
+  process.env.TRANSCRIPTION_BACKEND || envConfig.TRANSCRIPTION_BACKEND || 'local';
 
 // Local whisper.cpp settings
-const WHISPER_BIN = process.env.WHISPER_BIN || 'whisper-cli';
+const WHISPER_BIN = process.env.WHISPER_BIN || envConfig.WHISPER_BIN || 'whisper-cli';
 const WHISPER_MODEL =
   process.env.WHISPER_MODEL ||
+  envConfig.WHISPER_MODEL ||
   path.join(process.cwd(), 'data', 'models', 'ggml-base.bin');
 
 // OpenAI API settings
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || envConfig.OPENAI_API_KEY || '';
 const OPENAI_WHISPER_URL = 'https://api.openai.com/v1/audio/transcriptions';
 
 async function transcribeLocal(audioBuffer: Buffer): Promise<string | null> {
