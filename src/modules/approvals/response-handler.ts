@@ -19,7 +19,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
-import { getApprovalHandler } from './primitive.js';
+import { getApprovalHandler, pickApprover } from './primitive.js';
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
   // OneCLI credential approvals — resolved via in-memory Promise first.
@@ -54,6 +54,31 @@ async function handleRegisteredApproval(
   const session = getSession(approval.session_id);
   if (!session) {
     deletePendingApproval(approval.approval_id);
+    return;
+  }
+
+  // Click authorization: the responder must be in the approver list for this
+  // session's agent group. We deliver the card to multiple targets (DM +
+  // origin chat) for visibility, which means non-admin chat members might
+  // see the buttons. This check prevents them from approving on the admin's
+  // behalf. The userId comes from the channel adapter's response payload —
+  // for a button-click in a chat, that's the clicker's namespaced user id.
+  // Empty userId (legacy or untrusted responder) is rejected.
+  if (!userId) {
+    log.warn('Approval click had no userId — ignoring', {
+      approvalId: approval.approval_id,
+      action: approval.action,
+    });
+    return;
+  }
+  const approvers = pickApprover(session.agent_group_id);
+  if (!approvers.includes(userId)) {
+    log.warn('Approval click from non-approver — ignoring', {
+      approvalId: approval.approval_id,
+      action: approval.action,
+      clicker: userId,
+      approvers,
+    });
     return;
   }
 

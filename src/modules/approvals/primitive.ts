@@ -195,26 +195,77 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
-    try {
-      await adapter.deliver(
-        target.messagingGroup.channel_type,
-        target.messagingGroup.platform_id,
-        null,
-        'chat-sdk',
-        JSON.stringify({
-          type: 'ask_question',
-          questionId: approvalId,
-          title,
-          question,
-          options: APPROVAL_OPTIONS,
-        }),
+    const cardPayload = JSON.stringify({
+      type: 'ask_question',
+      questionId: approvalId,
+      title,
+      question,
+      options: APPROVAL_OPTIONS,
+    });
+
+    // Belt-and-suspenders delivery: send the card to the picked DM AND to
+    // the originating messaging group (the chat the agent was active in
+    // when it requested the approval). The DM is the right primary
+    // destination for privacy and routing reasons, but a stale user_dms
+    // cache row — pointing at an abandoned 1:1 the operator no longer
+    // watches — can quietly route the card into the void. Posting to the
+    // origin chat too means the operator sees it where they're already
+    // paying attention. Click authorization is enforced in the response
+    // handler (verifies the clicker is an eligible approver), so the
+    // wider audience doesn't widen the action surface.
+    const targets: { channel_type: string; platform_id: string; label: string }[] = [];
+    targets.push({
+      channel_type: target.messagingGroup.channel_type,
+      platform_id: target.messagingGroup.platform_id,
+      label: `DM (${target.userId})`,
+    });
+    if (session.messaging_group_id && session.messaging_group_id !== target.messagingGroup.id) {
+      const origin = getMessagingGroup(session.messaging_group_id);
+      if (
+        origin &&
+        // Avoid double-send if origin and DM resolve to the same physical
+        // chat (e.g. session is in the user's 1:1 DM already).
+        !(
+          origin.channel_type === target.messagingGroup.channel_type &&
+          origin.platform_id === target.messagingGroup.platform_id
+        )
+      ) {
+        targets.push({
+          channel_type: origin.channel_type,
+          platform_id: origin.platform_id,
+          label: `origin (${origin.name ?? origin.id})`,
+        });
+      }
+    }
+
+    let anyDelivered = false;
+    for (const t of targets) {
+      try {
+        await adapter.deliver(t.channel_type, t.platform_id, null, 'chat-sdk', cardPayload);
+        anyDelivered = true;
+      } catch (err) {
+        log.warn('Approval card delivery to one target failed', {
+          action,
+          approvalId,
+          target: t.label,
+          err,
+        });
+      }
+    }
+    if (!anyDelivered) {
+      notifyAgent(
+        session,
+        `${action} failed: could not deliver approval card to any target (${targets.map((t) => t.label).join(', ')}).`,
       );
-    } catch (err) {
-      log.error('Failed to deliver approval card', { action, approvalId, err });
-      notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
       return;
     }
   }
 
-  log.info('Approval requested', { action, approvalId, agentName, approver: target.userId });
+  log.info('Approval requested', {
+    action,
+    approvalId,
+    agentName,
+    approver: target.userId,
+    deliveredTo: session.messaging_group_id ? 'dm+origin' : 'dm',
+  });
 }
