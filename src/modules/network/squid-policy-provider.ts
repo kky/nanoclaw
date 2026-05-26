@@ -558,11 +558,41 @@ function generateSocatForwardsConfig(agents: AgentGroup[], ips: IpMap): string {
   return lines.join('\n');
 }
 
-function writeSocatForwardsConfig(): void {
+/**
+ * Compare two socat-forwards.conf bodies by their meaningful forwarder
+ * lines only — ignoring comments and blank lines, order-insensitive. Used
+ * to detect whether a config regen changed the forwarder *set*. The
+ * container entrypoint reads /etc/socat-forwards.conf only at start and
+ * spawns one socat process per line, so `squid -k reconfigure` can't add or
+ * remove a forwarder; a changed set requires a container restart instead.
+ */
+function socatForwardsDiffer(prev: string, next: string): boolean {
+  const forwarders = (body: string): string[] =>
+    body
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'))
+      .sort();
+  const a = forwarders(prev);
+  const b = forwarders(next);
+  if (a.length !== b.length) return true;
+  return a.some((line, i) => line !== b[i]);
+}
+
+/**
+ * Regenerate socat-forwards.conf from the DB. Returns true if the forwarder
+ * set changed since the last write — the caller must then restart the Squid
+ * container (not just `squid -k reconfigure`) so the entrypoint respawns the
+ * socat processes from the new file.
+ */
+function writeSocatForwardsConfig(): boolean {
   const agents = getAllAgentGroups();
   const ips = loadIpMap();
   fs.mkdirSync(SQUID_DIR, { recursive: true });
-  fs.writeFileSync(SOCAT_FORWARDS_FILE, generateSocatForwardsConfig(agents, ips));
+  const next = generateSocatForwardsConfig(agents, ips);
+  const prev = fs.existsSync(SOCAT_FORWARDS_FILE) ? fs.readFileSync(SOCAT_FORWARDS_FILE, 'utf8') : '';
+  fs.writeFileSync(SOCAT_FORWARDS_FILE, next);
+  return socatForwardsDiffer(prev, next);
 }
 
 // ── Log rotation ────────────────────────────────────────────────────────────
@@ -777,6 +807,22 @@ function reconfigureSquid(): void {
   }
 }
 
+// `squid -k reconfigure` reloads ACLs only — socat forwarders are spawned by
+// the entrypoint at container start, so adding/removing a CDP forwarder needs
+// a restart. The restart also re-reads squid.conf (re-rendered by the
+// entrypoint), so any ACL changes in the same regen are applied too.
+function restartSquidContainer(): void {
+  if (!containerRunning(CONTAINER_NAME)) return;
+  try {
+    execFileSync(CONTAINER_RUNTIME_BIN, ['restart', CONTAINER_NAME], { stdio: 'pipe' });
+    log.info('squid-policy-provider: restarted container to apply socat forwarder change', {
+      container: CONTAINER_NAME,
+    });
+  } catch (err) {
+    log.warn('squid-policy-provider: restart failed', { err });
+  }
+}
+
 function createEgressNetwork(): void {
   execFileSync(
     CONTAINER_RUNTIME_BIN,
@@ -858,7 +904,7 @@ export const squidPolicyProvider: NetworkPolicyProvider = {
 
     writeSquidConfig();
     writeDnsmasqConfig();
-    writeSocatForwardsConfig();
+    const socatChanged = writeSocatForwardsConfig();
     fs.mkdirSync(LOGS_DIR, { recursive: true });
 
     // Rotate logs at boot if a month has elapsed since last rotation,
@@ -868,6 +914,11 @@ export const squidPolicyProvider: NetworkPolicyProvider = {
 
     if (!containerRunning(CONTAINER_NAME)) {
       startSquidContainer();
+    } else if (socatChanged) {
+      // A CDP forwarder was added or removed. Reconfigure can't spawn or kill
+      // socat processes, so restart the container to respawn them from the
+      // regenerated /etc/socat-forwards.conf.
+      restartSquidContainer();
     } else {
       reconfigureSquid();
     }
@@ -973,6 +1024,7 @@ export const __test__ = {
   toDstdomainEntry,
   generateSquidConfig,
   generateSocatForwardsConfig,
+  socatForwardsDiffer,
   generateDnsmasqConfig,
   rewriteProxyEnv,
   monthKey,
